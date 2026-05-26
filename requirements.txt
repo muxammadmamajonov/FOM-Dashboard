@@ -6,5 +6,8 @@ aiogram>=3.4,<4.0
 # Loads configuration from a .env file (12-factor config).
 python-dotenv>=1.0.0,<2.0.0
 
-# Async file I/O for non-blocking reads/writes during save and backup.
+# Async file I/O for non-blocking reads of the temp file before upload.
 aiofiles>=23.0.0,<25.0.0
+
+# Async S3 client used to talk to Cloudflare R2 (S3-compatible API).
+aioboto3>=13.0,<14.0

@@ -1,0 +1,17 @@
+{
+  "name": "fom-dashboard-worker",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Cloudflare Worker that serves the FOM CEO Dashboard from an R2 bucket.",
+  "scripts": {
+    "deploy": "wrangler deploy",
+    "dev": "wrangler dev",
+    "tail": "wrangler tail",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20240900.0",
+    "typescript": "^5.4.0",
+    "wrangler": "^4.0.0"
+  }
+}

@@ -1,0 +1,23 @@
+# wrangler config for the FOM Dashboard Worker.
+#
+# Deploy: cd worker && npx wrangler deploy
+# Logs:   cd worker && npx wrangler tail
+#
+# The bucket must exist before first deploy:
+#   cd worker && npx wrangler r2 bucket create fom-dashboard
+# (Change the bucket name below + in your .env's R2_BUCKET_NAME if you prefer
+#  a different one — the Worker and the Python bot must agree.)
+
+name = "fom-dashboard"
+main = "src/index.ts"
+compatibility_date = "2025-05-01"
+
+# Optional observability — gives you per-request logs in the dashboard.
+[observability]
+enabled = true
+
+# R2 binding. `binding` is the variable name in src/index.ts (env.DASHBOARD_BUCKET);
+# `bucket_name` is the actual bucket in your Cloudflare account.
+[[r2_buckets]]
+binding = "DASHBOARD_BUCKET"
+bucket_name = "fom-dashboard"

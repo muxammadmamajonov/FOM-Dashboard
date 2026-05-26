@@ -23,6 +23,12 @@ uploads/backups/
 # manual testing; it must never enter git history).
 /index.html
 
+# Cloudflare Worker build/dev artifacts
+worker/node_modules/
+worker/.wrangler/
+worker/dist/
+worker/*.tsbuildinfo
+
 # OS / editor cruft
 .DS_Store
 .idea/

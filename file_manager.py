@@ -1,21 +1,30 @@
-"""File-system operations for the dashboard bot.
+"""R2-backed file storage for the FOM Dashboard bot.
 
-Encapsulates validation, atomic saves, and backup rotation behind a single
-:class:`FileManager` so the Telegram handlers stay focused on messaging.
+The bot writes the validated, fullscreen-injected HTML to a Cloudflare R2
+bucket (S3-compatible). The Worker under ``worker/`` reads the same bucket and
+serves it at a permanent ``*.workers.dev`` URL — so the bot can run anywhere,
+the dashboard URL never changes, and there is no local web server or tunnel
+to keep alive.
 
-The central safety property here is *atomicity*: a new dashboard is streamed to
-a temporary file inside the target directory and only then ``os.replace``-d over
-``index.html``. Because ``os.replace`` is atomic on a single filesystem, a crash
-mid-write can never leave a half-written, corrupt dashboard in place.
+Storage layout in the bucket:
+
+    index.html                                  current dashboard
+    backups/index_YYYYMMDD_HHMMSS_HASH8.html    rotated previous versions
+
+Atomicity is provided by R2 itself: each ``PutObject`` is a single atomic
+write. Backups are created before the new upload, so a failed upload cannot
+destroy the previous version.
 """
 
 from __future__ import annotations
 
-import os
-from pathlib import Path
+import hashlib
 from typing import Any, Dict, Optional, Tuple
 
+import aioboto3
 import aiofiles
+from botocore.config import Config as BotoConfig
+from botocore.exceptions import BotoCoreError, ClientError
 
 import utils
 from config import Config
@@ -23,6 +32,15 @@ from logger import get_logger
 from utils import MIN_HTML_SIZE
 
 logger = get_logger(__name__)
+
+# Object key layout inside the R2 bucket.
+INDEX_KEY = "index.html"
+BACKUP_PREFIX = "backups/"
+MAX_BACKUPS = 10
+
+# Custom metadata header stored on each object so we can dedupe and name
+# backups without re-downloading the full body.
+_HASH_META_KEY = "content-sha256"
 
 # Telegram clients report wildly inconsistent MIME types for .html uploads
 # (commonly "application/octet-stream"). The client-supplied MIME is untrusted
@@ -43,26 +61,34 @@ _REJECTED_MIME_EXACT = {
 }
 
 _DOCTYPE_MARKER = "<!doctype html"
-_CHUNK_SIZE = 65_536
+_CONTENT_TYPE = "text/html; charset=utf-8"
+_CACHE_CONTROL = "no-store, must-revalidate"
 
 
 class FileManager:
-    """Owns all reads/writes under the configured upload directory.
+    """Owns all reads/writes against the configured R2 bucket.
 
     Args:
-        config: The validated application configuration. The manager derives the
-            upload folder, backups folder, index path, size limit, and backup
-            toggle from it.
+        config: The validated application configuration. The manager derives
+            the endpoint, credentials, bucket, size limit, and feature flags
+            from it. R2 clients are short-lived: one is opened per save.
     """
 
     def __init__(self, config: Config) -> None:
         self._config = config
-        self._upload_folder: Path = config.upload_folder_path
-        self._backups_folder: Path = config.backups_folder_path
-        self._index_path: Path = config.index_file_path
+        self._bucket: str = config.r2_bucket_name
         self._max_file_size: int = config.max_file_size
         self._backup_enabled: bool = config.backup_enabled
         self._webapp_fullscreen: bool = config.webapp_fullscreen_enabled
+        self._session = aioboto3.Session()
+        # Modest connect/read timeouts so transient R2 hiccups surface quickly
+        # instead of hanging the upload handler indefinitely.
+        self._boto_config = BotoConfig(
+            connect_timeout=10,
+            read_timeout=60,
+            retries={"max_attempts": 3, "mode": "standard"},
+            signature_version="s3v4",
+        )
 
     # ------------------------------------------------------------- validation
     async def validate_html_file(
@@ -87,6 +113,8 @@ class FileManager:
             ``(True, None)`` when valid, otherwise ``(False, message)`` where
             ``message`` is a user-friendly explanation of the first failure.
         """
+        from pathlib import Path
+
         path = Path(file_path)
         if not path.is_file():
             return self._fail("not_found", original_filename)
@@ -129,234 +157,181 @@ class FileManager:
 
     # ------------------------------------------------------------------- save
     async def save_html_file(self, file_path: str, admin_id: int) -> Dict[str, Any]:
-        """Atomically install ``file_path`` as the served ``index.html``.
+        """Inject the Mini App bootstrap and upload ``file_path`` to R2.
 
-        Backs up the existing dashboard first (when backups are enabled), then
-        streams the new file to a sibling temp file and atomically replaces the
-        target. Old backups are rotated afterwards.
+        Flow: read the validated temp file -> inject (when enabled) -> compute
+        SHA-256 -> back up the existing ``index.html`` to ``backups/...`` if it
+        differs -> PutObject the new ``index.html`` -> rotate old backups.
 
         Args:
-            file_path: Path to the validated temporary file to install.
+            file_path: Path to the validated temporary file.
             admin_id: Telegram id of the uploading admin (for logging context).
 
         Returns:
-            A result dict: ``{'success': bool, 'message': str,
-            'file_size': int, 'timestamp': str}``.
+            ``{'success': bool, 'message': str, 'file_size': int,
+            'timestamp': str}``.
         """
         timestamp = utils.get_iso_timestamp()
         try:
-            self._upload_folder.mkdir(parents=True, exist_ok=True)
+            data = await self._prepare_payload(file_path)
+            content_hash = hashlib.sha256(data).hexdigest()
 
-            if self._backup_enabled and self._index_path.exists():
-                created = await self.create_backup(str(self._index_path))
-                if not created:
-                    # A failed backup must not silently lose the prior version.
-                    logger.warning(
-                        "Backup step did not produce a file; aborting save to "
-                        "avoid overwriting the previous dashboard."
-                    )
-                    return {
-                        "success": False,
-                        "message": "Backup of the previous version failed.",
-                        "file_size": 0,
-                        "timestamp": timestamp,
-                    }
+            async with self._client() as s3:
+                if self._backup_enabled:
+                    backed_up = await self._backup_current(s3, content_hash)
+                    if not backed_up:
+                        return self._result(
+                            False, "Backup of the previous version failed.",
+                            0, timestamp,
+                        )
 
-            file_size = await self._install(file_path)
+                await s3.put_object(
+                    Bucket=self._bucket,
+                    Key=INDEX_KEY,
+                    Body=data,
+                    ContentType=_CONTENT_TYPE,
+                    CacheControl=_CACHE_CONTROL,
+                    Metadata={_HASH_META_KEY: content_hash},
+                )
+                logger.info(
+                    "Uploaded dashboard to R2 r2://%s/%s (%s) for admin_id=%s",
+                    self._bucket, INDEX_KEY,
+                    utils.human_readable_size(len(data)), admin_id,
+                )
 
-            logger.info(
-                "Saved dashboard to %s (%s) for admin_id=%s",
-                self._index_path,
-                utils.human_readable_size(file_size),
-                admin_id,
-            )
+                await self._cleanup_backups(s3)
 
-            await self.cleanup_old_backups()
+            return self._result(True, "Dashboard updated successfully.",
+                                len(data), timestamp)
 
-            return {
-                "success": True,
-                "message": "Dashboard updated successfully.",
-                "file_size": file_size,
-                "timestamp": timestamp,
-            }
-        except PermissionError as exc:
-            logger.error("Permission denied writing dashboard: %s", exc)
-            return {
-                "success": False,
-                "message": "Permission denied writing to the upload folder.",
-                "file_size": 0,
-                "timestamp": timestamp,
-            }
+        except ClientError as exc:
+            code = exc.response.get("Error", {}).get("Code", "?")
+            logger.error("R2 ClientError %s: %s", code, exc, exc_info=True)
+            return self._result(False, f"Cloud storage error ({code}).",
+                                0, timestamp)
+        except BotoCoreError as exc:
+            logger.error("R2 transport error: %s", exc, exc_info=True)
+            return self._result(False, f"Cloud storage error: {exc}",
+                                0, timestamp)
         except OSError as exc:
-            logger.error("File system error during save: %s", exc, exc_info=True)
-            return {
-                "success": False,
-                "message": f"File system error: {exc}",
-                "file_size": 0,
-                "timestamp": timestamp,
-            }
-
-    async def _install(self, source_path: str) -> int:
-        """Read the validated upload, optionally inject the Mini App bootstrap,
-        and atomically write it as ``index.html``.
-
-        Args:
-            source_path: Path to the validated temporary file.
-
-        Returns:
-            The number of bytes written to ``index.html``.
-        """
-        async with aiofiles.open(source_path, "rb") as src:
-            raw = await src.read()
-
-        data = raw
-        if self._webapp_fullscreen:
-            try:
-                injected = utils.inject_telegram_webapp_fullscreen(
-                    raw.decode("utf-8")
-                )
-                data = injected.encode("utf-8")
-                if len(data) != len(raw):
-                    logger.info("Injected Telegram Mini App fullscreen script")
-                else:
-                    logger.debug("Fullscreen script already present; left as-is")
-            except UnicodeDecodeError:
-                # Validation already proved it is UTF-8, but never corrupt the
-                # save over an injection problem — fall back to the raw bytes.
-                logger.warning("Could not decode for injection; saving as-is")
-                data = raw
-
-        return await self._atomic_write(data)
-
-    async def _atomic_write(self, data: bytes) -> int:
-        """Write ``data`` to ``index.html`` atomically (temp + fsync + replace).
-
-        Returns:
-            The number of bytes written.
-        """
-        # Temp file lives in the destination directory so os.replace stays on
-        # the same filesystem and is therefore atomic.
-        tmp_path = self._index_path.with_name(
-            f".index.{utils.generate_request_id()}.tmp"
-        )
-        try:
-            async with aiofiles.open(tmp_path, "wb") as dst:
-                await dst.write(data)
-                await dst.flush()
-                os.fsync(dst.fileno())
-
-            # Verify the temp file matches what we intended before committing.
-            actual = tmp_path.stat().st_size
-            if actual != len(data):
-                raise OSError(
-                    f"Write verification failed: expected {len(data)} "
-                    f"bytes, found {actual}."
-                )
-
-            os.replace(tmp_path, self._index_path)
-            return len(data)
-        finally:
-            # If replace succeeded the temp file is gone; otherwise clean it up.
-            if tmp_path.exists():
-                try:
-                    tmp_path.unlink()
-                except OSError:
-                    logger.debug("Could not remove temp file %s", tmp_path)
+            logger.error("Local I/O error before upload: %s", exc, exc_info=True)
+            return self._result(False, f"I/O error: {exc}", 0, timestamp)
 
     # ----------------------------------------------------------------- backup
-    async def create_backup(self, source_path: str) -> bool:
-        """Copy ``source_path`` into the backups folder with a stamped name.
+    async def _backup_current(self, s3, new_content_hash: str) -> bool:
+        """Server-side copy ``index.html`` to a timestamped backup key.
 
-        The backup filename is ``index_<YYYYMMDD_HHMMSS>_<hash8>.html``. If the
-        most recent backup already has the same content hash, the upload is a
-        duplicate and no new backup is created (this is reported as success).
+        Skipped (returned ``True``) when there is no existing dashboard or when
+        the existing dashboard's content hash matches the new upload (i.e. the
+        admin re-uploaded the same file).
 
         Args:
-            source_path: Path to the current dashboard file to back up.
+            s3: An open aioboto3 S3 client.
+            new_content_hash: SHA-256 hex of the about-to-be-uploaded payload.
 
         Returns:
-            ``True`` if a backup exists for the current content afterwards
-            (whether freshly written or an existing duplicate), ``False`` on
-            failure.
+            ``True`` on success (or no-op), ``False`` if the copy failed.
         """
-        source = Path(source_path)
-        if not source.exists():
-            logger.debug("No existing dashboard to back up at %s", source)
-            # Nothing to back up is not an error; there is simply no prior file.
-            return True
-
         try:
-            self._backups_folder.mkdir(parents=True, exist_ok=True)
-            content_hash = utils.calculate_file_hash(source_path)[:8]
-
-            if self._is_duplicate_of_latest(content_hash):
-                logger.info(
-                    "Skipping backup: content hash %s matches latest backup.",
-                    content_hash,
-                )
+            head = await s3.head_object(Bucket=self._bucket, Key=INDEX_KEY)
+        except ClientError as exc:
+            code = exc.response.get("Error", {}).get("Code")
+            status = exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+            if code in ("404", "NoSuchKey", "NotFound") or status == 404:
+                logger.debug("No prior dashboard in R2 to back up")
                 return True
-
-            backup_name = (
-                f"index_{utils.get_backup_timestamp()}_{content_hash}.html"
-            )
-            backup_path = Path(
-                utils.get_safe_file_path(str(self._backups_folder), backup_name)
-            )
-
-            await self._copy_file(source_path, str(backup_path))
-            logger.info("Backup created: %s", backup_path.name)
-            return True
-        except (OSError, ValueError) as exc:
-            logger.error("Failed to create backup: %s", exc, exc_info=True)
+            logger.error("HEAD on current index failed: %s", exc)
             return False
 
-    async def cleanup_old_backups(self, max_keep: int = 10) -> None:
-        """Delete the oldest backups, keeping only the most recent ``max_keep``.
-
-        Args:
-            max_keep: Number of newest backups to retain.
-        """
-        try:
-            backups = sorted(
-                self._backups_folder.glob("index_*.html"),
-                key=lambda p: p.stat().st_mtime,
-                reverse=True,
+        existing_hash = head.get("Metadata", {}).get(_HASH_META_KEY, "")
+        if existing_hash == new_content_hash:
+            logger.info(
+                "Skipping backup: content hash %s matches current dashboard",
+                new_content_hash[:8],
             )
-        except OSError as exc:
+            return True
+
+        hash8 = (existing_hash or "unknown ")[:8]
+        backup_key = (
+            f"{BACKUP_PREFIX}index_{utils.get_backup_timestamp()}_{hash8}.html"
+        )
+        try:
+            await s3.copy_object(
+                Bucket=self._bucket,
+                Key=backup_key,
+                CopySource={"Bucket": self._bucket, "Key": INDEX_KEY},
+                MetadataDirective="COPY",
+            )
+            logger.info("Backup created: %s", backup_key)
+            return True
+        except ClientError as exc:
+            logger.error("Failed to copy backup %s: %s", backup_key, exc)
+            return False
+
+    async def _cleanup_backups(self, s3) -> None:
+        """Delete all but the newest :data:`MAX_BACKUPS` backups."""
+        try:
+            paginator = s3.get_paginator("list_objects_v2")
+            items: list[dict] = []
+            async for page in paginator.paginate(
+                Bucket=self._bucket, Prefix=BACKUP_PREFIX
+            ):
+                items.extend(page.get("Contents", []) or [])
+        except ClientError as exc:
             logger.error("Could not list backups for rotation: %s", exc)
             return
 
-        for stale in backups[max_keep:]:
+        items.sort(key=lambda obj: obj["LastModified"], reverse=True)
+        for old in items[MAX_BACKUPS:]:
             try:
-                stale.unlink()
-                logger.debug("Removed old backup: %s", stale.name)
-            except OSError as exc:
-                logger.warning("Could not remove old backup %s: %s", stale, exc)
+                await s3.delete_object(Bucket=self._bucket, Key=old["Key"])
+                logger.debug("Removed old backup: %s", old["Key"])
+            except ClientError as exc:
+                logger.warning(
+                    "Could not delete old backup %s: %s", old["Key"], exc
+                )
 
     # ----------------------------------------------------------------- helpers
-    def _is_duplicate_of_latest(self, content_hash: str) -> bool:
-        """Return ``True`` if the newest backup's name carries ``content_hash``."""
-        backups = sorted(
-            self._backups_folder.glob("index_*.html"),
-            key=lambda p: p.stat().st_mtime,
-            reverse=True,
-        )
-        if not backups:
-            return False
-        # Filename layout: index_<date>_<time>_<hash8>.html
-        return backups[0].stem.endswith(f"_{content_hash}")
+    async def _prepare_payload(self, file_path: str) -> bytes:
+        """Read the temp file and (optionally) inject the fullscreen bootstrap."""
+        async with aiofiles.open(file_path, "rb") as src:
+            raw = await src.read()
 
-    @staticmethod
-    async def _copy_file(source_path: str, dest_path: str) -> None:
-        """Stream-copy ``source_path`` to ``dest_path`` using bounded memory."""
-        async with aiofiles.open(source_path, "rb") as src, aiofiles.open(
-            dest_path, "wb"
-        ) as dst:
-            while True:
-                chunk = await src.read(_CHUNK_SIZE)
-                if not chunk:
-                    break
-                await dst.write(chunk)
+        if not self._webapp_fullscreen:
+            return raw
+
+        try:
+            injected = utils.inject_telegram_webapp_fullscreen(
+                raw.decode("utf-8")
+            )
+            data = injected.encode("utf-8")
+            if len(data) != len(raw):
+                logger.info("Injected Telegram Mini App fullscreen script")
+            else:
+                logger.debug("Fullscreen script already present; left as-is")
+            return data
+        except UnicodeDecodeError:
+            # Validation already proved it is UTF-8, but never corrupt the
+            # save over an injection problem -- fall back to the raw bytes.
+            logger.warning("Could not decode for injection; uploading as-is")
+            return raw
+
+    def _client(self):
+        """Open an async R2 client bound to the configured account/credentials.
+
+        Returns:
+            An async context manager yielding an aiobotocore S3 client.
+        """
+        return self._session.client(
+            "s3",
+            endpoint_url=self._config.r2_endpoint_url,
+            aws_access_key_id=self._config.r2_access_key_id,
+            aws_secret_access_key=self._config.r2_secret_access_key,
+            # R2 ignores the region but the SDK requires one. "auto" is the
+            # value Cloudflare's documentation recommends.
+            region_name="auto",
+            config=self._boto_config,
+        )
 
     def _mime_is_acceptable(self, mime_type: Optional[str]) -> bool:
         """Return ``True`` unless the reported MIME is clearly a non-HTML binary.
@@ -384,3 +359,13 @@ class FileManager:
             "HTML validation FAILED for '%s': %s%s", filename, error_key, detail
         )
         return False, message
+
+    @staticmethod
+    def _result(success: bool, message: str, size: int, ts: str) -> Dict[str, Any]:
+        """Shape the public result dict consumed by the handler layer."""
+        return {
+            "success": success,
+            "message": message,
+            "file_size": size,
+            "timestamp": ts,
+        }
