@@ -33,4 +33,4 @@ WEBAPP_FULLSCREEN_ENABLED = "true"     # set to "false" to skip script injection
 # `wrangler kv namespace create DASHBOARD_KV` you will get an id; paste it here.
 [[kv_namespaces]]
 binding = "DASHBOARD_KV"
-id = "REPLACE_WITH_YOUR_KV_NAMESPACE_ID"
+id = "0589cf23c00d4e38b46adb2cc85a49e3"
