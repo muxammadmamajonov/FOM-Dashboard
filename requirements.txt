@@ -1,0 +1,10 @@
+# Core async Telegram framework (3.x). A maintained 3.x release is pinned
+# rather than 3.0.0 to pick up bug/security fixes; the code is written to be
+# compatible across the 3.4–3.x line.
+aiogram>=3.4,<4.0
+
+# Loads configuration from a .env file (12-factor config).
+python-dotenv>=1.0.0,<2.0.0
+
+# Async file I/O for non-blocking reads/writes during save and backup.
+aiofiles>=23.0.0,<25.0.0
