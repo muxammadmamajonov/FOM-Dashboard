@@ -1,23 +1,36 @@
 # wrangler config for the FOM Dashboard Worker.
 #
-# Deploy: cd worker && npx wrangler deploy
-# Logs:   cd worker && npx wrangler tail
+# This Worker is the entire bot. It receives Telegram webhooks, stores the
+# dashboard in KV (single key), and serves the dashboard at `/`.
 #
-# The bucket must exist before first deploy:
-#   cd worker && npx wrangler r2 bucket create fom-dashboard
-# (Change the bucket name below + in your .env's R2_BUCKET_NAME if you prefer
-#  a different one — the Worker and the Python bot must agree.)
+# First-time setup (from this directory):
+#   npm install
+#   npx wrangler login
+#   npx wrangler kv namespace create DASHBOARD_KV     # copy printed id below
+#   npx wrangler secret put TELEGRAM_BOT_TOKEN        # token from @BotFather
+#   npx wrangler secret put WEBHOOK_SECRET            # any random hex string
+#   npx wrangler secret put ADMIN_USER_ID             # your Telegram user id
+#   npx wrangler secret put TELEGRAM_GROUP_CHAT_ID    # negative group chat id
+#   npx wrangler deploy
+#   # then point Telegram at the worker:
+#   ../scripts/setup-webhook.sh "https://<your-worker>.workers.dev"
 
 name = "fom-dashboard"
 main = "src/index.ts"
 compatibility_date = "2025-05-01"
 
-# Optional observability — gives you per-request logs in the dashboard.
+# Per-request logs in the Cloudflare dashboard. `npx wrangler tail` also works.
 [observability]
 enabled = true
 
-# R2 binding. `binding` is the variable name in src/index.ts (env.DASHBOARD_BUCKET);
-# `bucket_name` is the actual bucket in your Cloudflare account.
-[[r2_buckets]]
-binding = "DASHBOARD_BUCKET"
-bucket_name = "fom-dashboard"
+# Public (non-secret) configuration. Sensitive values are set via
+# `wrangler secret put` and are NOT placed here.
+[vars]
+WEBAPP_SHORT_NAME = "dashboard"        # BotFather Mini App short name (or "")
+WEBAPP_FULLSCREEN_ENABLED = "true"     # set to "false" to skip script injection
+
+# KV namespace that stores the dashboard. After running
+# `wrangler kv namespace create DASHBOARD_KV` you will get an id; paste it here.
+[[kv_namespaces]]
+binding = "DASHBOARD_KV"
+id = "REPLACE_WITH_YOUR_KV_NAMESPACE_ID"

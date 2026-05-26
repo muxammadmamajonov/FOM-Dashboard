@@ -1,67 +1,62 @@
 # FOM Dashboard Worker
 
-A tiny Cloudflare Worker that serves the dashboard from an R2 bucket.
+This Worker **is** the bot. It does four things:
 
-The Python bot writes `index.html` into the bucket via R2's S3-compatible API;
-this Worker reads the same key and serves it at a permanent `*.workers.dev`
-URL (or your own domain). The `backups/` prefix in the bucket is **not**
-exposed — only the live dashboard.
+1. **`POST /webhook`** — receives Telegram updates (verified by
+   `X-Telegram-Bot-Api-Secret-Token`), enforces admin-only uploads, downloads
+   the file from Telegram, validates it, injects the Telegram Mini App
+   fullscreen bootstrap, and writes it to Workers KV.
+2. **`GET /` / `GET /index.html`** — reads the one KV cell and streams it
+   back with `Cache-Control: no-store`.
+3. **Notifies the team group** after a successful upload, with a fullscreen
+   Mini App button (and a browser fallback).
+4. **Returns 404** for everything else. There are no other keys, no history.
 
-## One-time setup
+Source layout:
+
+```
+src/
+├── index.ts        # router
+├── webhook.ts      # secret-verified webhook entry
+├── upload.ts       # admin guard → download → validate → inject → KV.put → notify
+├── telegram.ts     # tiny Bot API client (getMe, getFile, sendMessage)
+├── validate.ts     # HTML validation
+├── inject.ts       # idempotent fullscreen-script injection
+├── dashboard.ts    # GET / handler
+└── env.ts          # Env type + helpers
+```
+
+## Setup
+
+See the top-level [README](../README.md). In short, from this directory:
 
 ```bash
-cd worker
-npm install                                  # installs wrangler + types locally
-npx wrangler login                           # opens browser, authenticates
-npx wrangler r2 bucket create fom-dashboard  # creates the bucket
-npx wrangler deploy                          # publishes the Worker
+npm install
+npx wrangler login
+npx wrangler kv namespace create DASHBOARD_KV   # paste id into wrangler.toml
+npx wrangler secret put TELEGRAM_BOT_TOKEN
+npx wrangler secret put WEBHOOK_SECRET
+npx wrangler secret put ADMIN_USER_ID
+npx wrangler secret put TELEGRAM_GROUP_CHAT_ID
+npx wrangler deploy
 ```
 
-The last command prints the Worker URL, for example:
-```
-https://fom-dashboard.<your-subdomain>.workers.dev
-```
+Then run `scripts/setup-webhook.sh` (in the project root) once.
 
-That URL is permanent. Put it in two places:
-
-1. The project's `.env` as `CLOUDFLARE_DOMAIN=<URL>` (used by the
-   group "Open in Browser" button).
-2. **@BotFather → /myapps → your app → Edit Web App URL**, paste the same URL
-   (used by the fullscreen Mini App button). After this, you should never
-   need to touch BotFather again.
-
-## R2 credentials for the Python bot
-
-The Worker reads R2 through its binding (no credentials needed), but the
-Python bot writes through R2's S3-compatible API and needs an API token.
-
-1. Open the [Cloudflare dashboard](https://dash.cloudflare.com/) → **R2** →
-   **Manage R2 API Tokens** → **Create API Token**.
-2. Permissions: **Object Read & Write**.
-3. Bucket: pick the bucket (`fom-dashboard`).
-4. Copy the **Access Key ID**, **Secret Access Key**, and your **Account ID**
-   (top-right corner of the R2 page) into the project `.env`:
-   ```
-   R2_ACCOUNT_ID=...
-   R2_ACCESS_KEY_ID=...
-   R2_SECRET_ACCESS_KEY=...
-   R2_BUCKET_NAME=fom-dashboard
-   ```
-
-## Day-to-day
+## Useful commands
 
 ```bash
-cd worker
-npx wrangler deploy   # re-deploy after editing src/index.ts
-npx wrangler tail     # stream live request logs
-npx wrangler dev      # run locally on http://localhost:8787 (uses real R2)
+npx wrangler deploy           # publish latest src/ to Cloudflare
+npx wrangler tail             # stream live request logs from the Worker
+npx wrangler dev              # local dev (talks to real KV by default)
+npx tsc --noEmit              # type-check without emitting JS
 ```
 
-## What this Worker does (and doesn't)
+## Why a single Worker (and not Worker + R2, or Python + tunnel)
 
-- `GET /` or `GET /index.html` → returns `index.html` from R2 with
-  `Cache-Control: no-store` (so each request sees the latest upload).
-- `HEAD` is supported, returns the same headers without a body.
-- Any other path → `404 Not Found`.
-- The bucket's `backups/` prefix is never reachable through the Worker.
-- The Worker is read-only; the bot is the only writer.
+- **Stateless serving + permanent URL** — the dashboard URL is the Worker's
+  workers.dev URL, which never changes.
+- **No laptop running 24/7** — nothing executes locally.
+- **No bucket / no backup history** — KV stores one cell; each upload
+  overwrites it. Nothing accumulates.
+- **One thing to deploy** — `wrangler deploy`. CI/CD is built in.

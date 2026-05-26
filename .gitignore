@@ -1,27 +1,7 @@
 # Secrets — never commit
 .env
-
-# Python
-__pycache__/
-*.py[cod]
-*.egg-info/
-.eggs/
-build/
-dist/
-
-# Virtual environments
-.venv/
-venv/
-env/
-
-# Runtime artifacts
-logs/
-uploads/index.html
-uploads/backups/
-
-# Local-only business data (the real CEO dashboard sits at project root for
-# manual testing; it must never enter git history).
-/index.html
+worker/.dev.vars
+worker/.dev.vars.*
 
 # Cloudflare Worker build/dev artifacts
 worker/node_modules/
@@ -29,8 +9,11 @@ worker/.wrangler/
 worker/dist/
 worker/*.tsbuildinfo
 
+# Local-only business data (the real CEO dashboard sits at project root for
+# manual testing; it must never enter git history).
+/index.html
+
 # OS / editor cruft
 .DS_Store
 .idea/
 .vscode/
-.run/
